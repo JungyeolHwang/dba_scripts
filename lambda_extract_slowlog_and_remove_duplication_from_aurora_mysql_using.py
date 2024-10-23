@@ -76,6 +76,40 @@ def get_elasticsearch_client(config: Config) -> Elasticsearch:
         logger.error(f"Elasticsearch 연결 실패: {str(e)}")
         raise
 
+def setup_index_mapping(es_client: Elasticsearch, index_name: str) -> None:
+    """인덱스 매핑 설정"""
+    mapping = {
+        "mappings": {
+            "properties": {
+                "timestamp": {"type": "date"},
+                "user": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "keyword"},
+                        "host": {"type": "keyword"}
+                    }
+                },
+                "query_time": {"type": "float"},
+                "lock_time": {"type": "float"},
+                "rows_examined": {"type": "integer"},
+                "rows_sent": {"type": "integer"},
+                "query": {"type": "text"}
+            }
+        }
+    }
+    
+    try:
+        # 기존 인덱스가 있다면 삭제
+        if es_client.indices.exists(index=index_name):
+            es_client.indices.delete(index=index_name)
+            
+        # 새 인덱스 생성
+        es_client.indices.create(index=index_name, body=mapping)
+        logger.info(f"Successfully created index {index_name} with mapping")
+    except Exception as e:
+        logger.error(f"Error setting up index mapping: {str(e)}")
+        raise
+
 class SlowQueryLogProcessor:
     def __init__(self, config: Config):
         self.config = config
@@ -155,7 +189,10 @@ class SlowQueryLogProcessor:
         """쿼리 블록 파싱"""
         result = {
             'timestamp': None,
-            'user': None,
+            'user': {
+                'name': None,
+                'host': None
+            },
             'query_time': 0.0,
             'lock_time': 0.0,
             'rows_examined': 0,
@@ -172,7 +209,12 @@ class SlowQueryLogProcessor:
                 if line.startswith('# Time:'):
                     result['timestamp'] = line[7:].strip()
                 elif line.startswith('# User@Host:'):
-                    result['user'] = line[12:].strip()
+                    user_host = line[12:].strip()
+                    # User@Host: user[user] @ localhost [127.0.0.1] 형식 파싱
+                    user_match = re.search(r'(\w+)\[\w+\]\s*@\s*([\w\.-]+)', user_host)
+                    if user_match:
+                        result['user']['name'] = user_match.group(1)
+                        result['user']['host'] = user_match.group(2)
                 elif line.startswith('# Query_time:'):
                     match = re.search(r'Query_time:\s*(\d+\.?\d*)\s+Lock_time:\s*(\d+\.?\d*)', line)
                     if match:
@@ -234,10 +276,10 @@ class SlowQueryLogProcessor:
     def _index_batch(self, batch: List[Dict[str, Any]]) -> int:
         """배치 인덱싱"""
         try:
-            index_name = f"{self.config.es_index_prefix}-{datetime.now().strftime('%Y.%m.%d')}"
+            index_name = f"{self.config.es_index_prefix}-eng-dbnode02"
             
-            if not self.es_client.indices.exists(index=index_name):
-                self.es_client.indices.create(index=index_name)
+            # 인덱스 매핑 설정
+            setup_index_mapping(self.es_client, index_name)
             
             actions = [
                 {
@@ -281,14 +323,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             total_processed += batch_size
             
             # CloudWatch 메트릭 업데이트
-            cloudwatch.put_metric_data(
-                Namespace='SlowQueryProcessor',
-                MetricData=[{
-                    'MetricName': 'ProcessedQueries',
-                    'Value': batch_size,
-                    'Unit': 'Count'
-                }]
-            )
+            # cloudwatch.put_metric_data(
+            #     Namespace='SlowQueryProcessor',
+            #     MetricData=[{
+            #         'MetricName': 'ProcessedQueries',
+            #         'Value': batch_size,
+            #         'Unit': 'Count'
+            #     }]
+            # )
         
         return {
             'statusCode': 200,
@@ -302,18 +344,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Lambda 실행 중 에러 발생: {str(e)}")
         
-        try:
-            cloudwatch.put_metric_data(
-                Namespace='SlowQueryProcessor',
-                MetricData=[{
-                    'MetricName': 'ProcessingFailure',
-                    'Value': 1,
-                    'Unit': 'Count'
-                }]
-            )
-        except:
-            pass
-            
         return {
             'statusCode': 500,
             'body': json.dumps({
