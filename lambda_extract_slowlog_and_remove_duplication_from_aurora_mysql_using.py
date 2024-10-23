@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Generator, Any, Tuple
+from typing import Optional, List, Dict, Generator, Any, Tuple, Set
 import boto3
 import os
 import logging
@@ -11,6 +11,7 @@ from elasticsearch.helpers import bulk
 import socket
 from functools import wraps
 import resource
+import hashlib  # 추가된 import
 
 # 로깅 설정
 logger = logging.getLogger()
@@ -89,42 +90,218 @@ def setup_index_mapping(es_client: Elasticsearch, index_name: str) -> None:
                         "host": {"type": "keyword"}
                     }
                 },
+                "query": {"type": "text"},
+                "normalized_query": {"type": "text"},
+                "query_hash": {"type": "keyword"},
                 "query_time": {"type": "float"},
                 "lock_time": {"type": "float"},
                 "rows_examined": {"type": "integer"},
                 "rows_sent": {"type": "integer"},
-                "query": {"type": "text"}
+                "execution_count": {"type": "integer"},
+                "timestamps": {"type": "date"},
+                "max_query_time": {"type": "float"},
+                "last_seen": {"type": "date"}
             }
+        },
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 1
         }
     }
     
     try:
-        # 기존 인덱스가 있다면 삭제
-        if es_client.indices.exists(index=index_name):
-            es_client.indices.delete(index=index_name)
-            
-        # 새 인덱스 생성
-        es_client.indices.create(index=index_name, body=mapping)
-        logger.info(f"Successfully created index {index_name} with mapping")
+        if not es_client.indices.exists(index=index_name):
+            es_client.indices.create(index=index_name, body=mapping)
+            logger.info(f"Successfully created index {index_name} with mapping")
     except Exception as e:
         logger.error(f"Error setting up index mapping: {str(e)}")
         raise
 
+class QueryNormalizer:
+    """SQL 쿼리 정규화 클래스"""
+    
+    def __init__(self):
+        self._init_patterns()
+        self._init_keywords()
+    
+    def _init_patterns(self) -> None:
+        """정규식 패턴 초기화"""
+        self._patterns = {
+            # 기본 패턴
+            'whitespace': re.compile(r'\s+'),
+            'comments': re.compile(r'/\*.*?\*/|--[^\n]*'),
+            'semicolon': re.compile(r';+$'),
+            
+            # 쿼리 요소 패턴
+            'date_format': re.compile(r"DATE_FORMAT\s*\([^,]+,\s*'[^']*'\)", re.IGNORECASE),
+            'numbers': re.compile(r'\b\d+\b'),
+            'quoted_strings': re.compile(r"'[^']*'"),
+            'in_clause': re.compile(r'IN\s*\([^)]+\)', re.IGNORECASE),
+            
+            # 식별자 패턴
+            'table_aliases': re.compile(
+                r'\b(?:AS\s+)?'  # AS (선택사항)
+                r'(?:'          # 그룹 시작
+                r'[`"][\w\s]+[`"]'  # 백틱/따옴표로 감싸진 별칭
+                r'|'            # 또는
+                r'[\w$]+)'      # 일반 별칭
+                r'\b', 
+                re.IGNORECASE
+            ),
+            'column_aliases': re.compile(
+                r'\b(?:'        # 단어 경계와 그룹 시작
+                r'[`"][\w\s]+[`"]'  # 백틱/따옴표로 감싸진 별칭
+                r'|'            # 또는
+                r'[\w$]+)'      # 일반 별칭
+                r'\.'           # 점
+                r'[\w$]+\b',    # 컬럼명
+                re.IGNORECASE
+            )
+        }
+    
+    def _init_keywords(self) -> None:
+        """SQL 키워드 초기화"""
+        self._keywords = {
+            # DDL 키워드
+            'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME',
+            # DML 키워드
+            'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE',
+            # 조인 관련 키워드
+            'JOIN', 'INNER', 'LEFT', 'RIGHT', 'OUTER', 'CROSS', 'NATURAL', 'ON',
+            # 조건절 키워드
+            'WHERE', 'AND', 'OR', 'NOT', 'IN', 'BETWEEN', 'LIKE', 'IS', 'NULL',
+            # 그룹/정렬 키워드
+            'GROUP BY', 'HAVING', 'ORDER BY', 'ASC', 'DESC',
+            # 기타 키워드
+            'AS', 'DISTINCT', 'UNION', 'ALL', 'LIMIT', 'OFFSET'
+        }
+        # 정규식 패턴 생성 (긴 키워드가 먼저 매칭되도록 길이 기준 정렬)
+        keywords_pattern = '|'.join(sorted(self._keywords, key=len, reverse=True))
+        self._patterns['keywords'] = re.compile(r'\b({0})\b'.format(keywords_pattern), re.IGNORECASE)
+
+    def _normalize_identifiers(self, query: str) -> str:
+        """식별자(테이블명, 컬럼명 등) 정규화"""
+        try:
+            # 테이블 별칭 정규화
+            def normalize_table_alias(match):
+                alias = match.group(0)
+                # 백틱/따옴표로 감싸진 경우
+                if alias.startswith('`') or alias.startswith('"'):
+                    return alias.upper()
+                # AS가 포함된 경우
+                if ' AS ' in alias.upper():
+                    parts = alias.split(maxsplit=2)
+                    return f"{parts[0]} AS {parts[2].upper()}"
+                return alias.upper()
+
+            # 컬럼 참조 정규화
+            def normalize_column_ref(match):
+                ref = match.group(0)
+                # 백틱/따옴표로 감싸진 경우
+                if ref.startswith('`') or ref.startswith('"'):
+                    return ref.upper()
+                return ref.upper()
+
+            query = self._patterns['table_aliases'].sub(normalize_table_alias, query)
+            query = self._patterns['column_aliases'].sub(normalize_column_ref, query)
+            return query
+
+        except Exception as e:
+            logger.error(f"식별자 정규화 중 오류 발생: {str(e)}")
+            return query
+
+    def _normalize_date_format(self, query: str) -> str:
+        """DATE_FORMAT 함수 정규화"""
+        def replace_date_format(match):
+            # DATE_FORMAT 함수 전체를 추출하고 정규화
+            func = match.group(0)
+            # 첫 번째 인자와 포맷 문자열 분리
+            parts = func.split(',', 1)
+            if len(parts) == 2:
+                # 첫 번째 인자는 그대로 유지하고 포맷 문자열을 ?로 대체
+                return "{0}, '?')".format(parts[0].strip())
+            return func
+        return self._patterns['date_format'].sub(replace_date_format, query)
+
+    def _normalize_in_clause(self, query: str) -> str:
+        """IN 절 정규화"""
+        def replace_in_clause(match):
+            content = match.group(0)
+            is_not = 'NOT IN' in content.upper()
+            prefix = 'NOT IN' if is_not else 'IN'
+            
+            # 괄호 내용 추출 및 정규화
+            start_idx = content.find('(')
+            end_idx = content.rfind(')')
+            if start_idx != -1 and end_idx != -1:
+                # 값들을 추출하고 정규화
+                values = [v.strip().strip("'").strip('"') for v in content[start_idx+1:end_idx].split(',')]
+                # 정렬하고 대문자로 변환
+                sorted_values = sorted(map(str.upper, values))
+                # 문자열로 결합 (f-string 대신 .format 사용)
+                values_str = ", ".join("'{0}'".format(v) for v in sorted_values)
+                return "{0} ({1})".format(prefix, values_str)
+            return content
+        
+        return self._patterns['in_clause'].sub(replace_in_clause, query)
+
+    def normalize_query(self, query: str) -> str:
+        """쿼리 문자열 정규화"""
+        try:
+            # SET TIMESTAMP 문 제거
+            query = re.sub(r'SET TIMESTAMP=\d+;', '', query)
+            
+            # USE 문 제거
+            query = re.sub(r'USE \w+;', '', query)
+            
+            # 기존 정규화 로직
+            query = query.strip()
+            query = self._patterns['semicolon'].sub('', query)
+            query = self._patterns['comments'].sub('', query)
+            query = self._patterns['whitespace'].sub(' ', query)
+            query = query.upper()
+            
+            # SQL 키워드 정규화
+            query = self._patterns['keywords'].sub(lambda m: m.group(0).upper(), query)
+            
+            # 각 요소 정규화
+            query = self._normalize_date_format(query)
+            query = self._normalize_in_clause(query)
+            query = self._normalize_identifiers(query)
+            
+            # 최종 공백 처리
+            query = ' '.join(query.split())
+            
+            return query
+                
+        except Exception as e:
+            logger.error(f"쿼리 정규화 중 오류 발생: {str(e)}")
+            return query.strip()
+
+    def generate_hash(self, query: str) -> str:
+        """정규화된 쿼리의 해시값 생성"""
+        normalized_query = self.normalize_query(query)
+        # 디버그를 위한 로깅 추가
+        logger.debug("Original query: {0}".format(query))
+        logger.debug("Normalized query: {0}".format(normalized_query))
+        return hashlib.md5(normalized_query.encode()).hexdigest()
+        
 class SlowQueryLogProcessor:
     def __init__(self, config: Config):
         self.config = config
         self.es_client = get_elasticsearch_client(config) if config.es_host else None
+        self.query_normalizer = QueryNormalizer()
         self._compile_regex_patterns()
-
+        
     def _compile_regex_patterns(self) -> None:
-        """정규 표현식 패턴 컴파일"""
+        """정규식 패턴 컴파일"""
         self._patterns = {
             'literals': re.compile(r"'[^']*'"),
             'numbers': re.compile(r"\d+"),
             'whitespace': re.compile(r'\s+'),
             'start_lines': re.compile(r"(Version: 8\.0\.28|started with:|Tcp port:|Time\s+Id Command\s+Argument)")
         }
-
+        
     def stream_log_files(self, instance_identifier: str, region: str) -> Generator[str, None, None]:
         """RDS 로그 파일을 스트리밍 방식으로 읽기"""
         rds_client = boto3.client('rds', region_name=region)
@@ -236,16 +413,17 @@ class SlowQueryLogProcessor:
         return result
 
     def _clean_query(self, query: str) -> str:
-        """쿼리 클리닝"""
+        """쿼리 문자열 정규화"""
         try:
-            normalized = query.strip()
-            normalized = re.sub(r'/\*.*?\*/', '', normalized)
-            normalized = re.sub(r'[\r\n]+', ' ', normalized)
-            return ' '.join(normalized.split())
+            return self.query_normalizer.normalize_query(query)
         except Exception as e:
-            logger.warning(f"쿼리 클리닝 중 오류 발생: {str(e)}")
-            return query
-
+            logger.warning("쿼리 클리닝 중 오류 발생: {0}".format(str(e)))
+            return query.strip()
+    
+    def _generate_query_hash(self, query: str) -> str:
+        """안정적인 쿼리 해시 생성"""
+        return self.query_normalizer.generate_hash(query)
+        
     def _is_valid_query(self, parsed: Dict[str, Any]) -> bool:
         """쿼리 유효성 검사"""
         return (
@@ -274,26 +452,71 @@ class SlowQueryLogProcessor:
             yield success_count
 
     def _index_batch(self, batch: List[Dict[str, Any]]) -> int:
-        """배치 인덱싱"""
+        """배치 인덱싱 with upsert"""
         try:
             index_name = f"{self.config.es_index_prefix}-eng-dbnode02"
             
             # 인덱스 매핑 설정
             setup_index_mapping(self.es_client, index_name)
             
-            actions = [
-                {
-                    "_index": index_name,
-                    "_source": query
+            actions = []
+            for query_data in batch:
+                # 쿼리 정규화 및 해시 생성
+                original_query = query_data['query']
+                normalized_query = self.query_normalizer.normalize_query(original_query)
+                # 원본 쿼리도 정규화 패턴 적용
+                cleaned_query = re.sub(r'USE \w+;\s*', '', original_query)
+                cleaned_query = re.sub(r'SET TIMESTAMP=\d+;\s*', '', cleaned_query)
+                query_hash = self.query_normalizer.generate_hash(normalized_query)
+                
+                current_timestamp = query_data['timestamp']
+                
+                # update 작업으로 변경
+                doc = {
+                    '_op_type': 'update',
+                    '_index': index_name,
+                    '_id': query_hash,
+                    'script': {
+                        'source': '''
+                            ctx._source.last_seen = params.timestamp;
+                            ctx._source.execution_count = (ctx._source.execution_count ?: 0) + 1;
+                            ctx._source.max_query_time = Math.max(ctx._source.max_query_time, params.query_time);
+                            if (ctx._source.timestamps === null) ctx._source.timestamps = [];
+                            if (!ctx._source.timestamps.contains(params.timestamp)) {
+                                ctx._source.timestamps.add(params.timestamp);
+                            }
+                        ''',
+                        'params': {
+                            'timestamp': current_timestamp,
+                            'query_time': query_data['query_time']
+                        }
+                    },
+                    'upsert': {
+                        'query': cleaned_query,  # 정규화된 원본 쿼리 저장
+                        'normalized_query': normalized_query,
+                        'query_hash': query_hash,
+                        'timestamp': current_timestamp,
+                        'user': query_data['user'],
+                        'query_time': query_data['query_time'],
+                        'lock_time': query_data['lock_time'],
+                        'rows_examined': query_data['rows_examined'],
+                        'rows_sent': query_data['rows_sent'],
+                        'execution_count': 1,
+                        'timestamps': [current_timestamp],
+                        'max_query_time': query_data['query_time'],
+                        'last_seen': current_timestamp
+                    }
                 }
-                for query in batch
-            ]
+                
+                actions.append(doc)
             
-            success, failed = bulk(self.es_client, actions, stats_only=True)
-            logger.info(f"배치 인덱싱 완료 - 성공: {success}, 실패: {failed}")
-            
-            return success
-            
+            # 벌크 작업 실행
+            if actions:
+                success, errors = bulk(self.es_client, actions, stats_only=True, refresh=True)
+                logger.info(f"배치 인덱싱 완료 - 성공: {success}, 실패: {errors}")
+                return success
+            return 0
+                
         except Exception as e:
             logger.error(f"배치 인덱싱 중 에러 발생: {str(e)}")
             return 0
