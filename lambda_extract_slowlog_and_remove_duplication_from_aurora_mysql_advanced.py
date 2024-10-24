@@ -575,9 +575,12 @@ class SlowQueryLogProcessor:
             current_timestamp = query_data['timestamp']
             self.logger.debug(f"Processing query with timestamp: {current_timestamp}")
             
+            # 인스턴스 ID를 포함한 동적 인덱스 이름 생성
+            index_name = f"{self.config.es_index_prefix}-{self.config.instance_id}"
+        
             document = {
                 '_op_type': 'update',
-                '_index': f"{self.config.es_index_prefix}-eng-dbnode02",
+                '_index': index_name
                 '_id': query_hash,
                 'script': {
                     'source': '''
@@ -610,7 +613,8 @@ class SlowQueryLogProcessor:
                     'execution_count': 1,
                     'timestamps': [current_timestamp],
                     'max_query_time': float(query_data['query_time']),
-                    'last_seen': current_timestamp
+                    'last_seen': current_timestamp,
+                    'instance_id': self.config.instance_id  # 인스턴스 ID도 문서에 포함
                 },
                 'retry_on_conflict': 3  # 충돌 발생 시 재시도
             }
@@ -630,7 +634,8 @@ class SlowQueryLogProcessor:
             return
             
         try:
-            index_name = f"{self.config.es_index_prefix}-eng-dbnode02"
+            # 동적 인덱스 이름 생성
+            index_name = f"{self.config.es_index_prefix}-{self.config.instance_id}"
             indexed = self.es_manager.bulk_index(self._batch, index_name)
             self._stats['indexed'] += indexed
             
