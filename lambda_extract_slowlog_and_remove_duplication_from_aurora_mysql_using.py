@@ -257,7 +257,7 @@ class ElasticsearchManager:
 
 class LogStreamProcessor:
     """로그 스트림 처리 클래스"""
-    def __init__(self, config: Config, query_normalizer: QueryNormalizer):
+    def __init__(self, config: Config, query_normalizer: QueryNormalizerProtocol):
         self.config = config
         self.query_normalizer = query_normalizer
         self._patterns = self._compile_regex_patterns()
@@ -386,9 +386,9 @@ class LogStreamProcessor:
 
 class SlowQueryLogProcessor:
     """슬로우 쿼리 로그 처리기"""
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, normalizer: QueryNormalizerProtocol = None):  # Protocol 사용
         self.config = config
-        self.query_normalizer = QueryNormalizer()
+        self.query_normalizer = normalizer or QueryNormalizer()
         self.es_manager = ElasticsearchManager(config)
         self.stream_processor = LogStreamProcessor(config, self.query_normalizer)
         self._batch: List[Dict[str, Any]] = []
