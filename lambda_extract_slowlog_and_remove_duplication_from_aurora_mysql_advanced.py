@@ -359,7 +359,93 @@ class LogStreamProcessor:
             result['query'] = ' '.join(query_lines)
                 
         return result
+    
+    def _try_compress_query(self, query_block: List[str]) -> Optional[List[str]]:
+        """
+        긴 쿼리 블록을 압축하여 처리 가능한 크기로 만듭니다.
         
+        Args:
+            query_block (List[str]): 압축할 쿼리 블록
+            
+        Returns:
+            Optional[List[str]]: 압축된 쿼리 블록. 압축이 불가능한 경우 None 반환
+        """
+        try:
+            # 메타데이터 라인과 쿼리 라인 분리
+            metadata_lines = []
+            query_lines = []
+            
+            for line in query_block:
+                if line.startswith('#'):
+                    metadata_lines.append(line)
+                else:
+                    query_lines.append(line)
+                    
+            if not query_lines:  # 쿼리가 없는 경우
+                return None
+                
+            # 쿼리 라인 합치기
+            full_query = ' '.join(query_lines)
+            
+            # 쿼리 압축 시도
+            compressed_query = self._compress_query_content(full_query)
+            
+            if compressed_query:
+                # 메타데이터와 압축된 쿼리 합치기
+                return metadata_lines + [compressed_query]
+                
+            return None
+            
+        except Exception as e:
+            logger.error(f"쿼리 압축 중 오류 발생: {str(e)}")
+            return None
+        
+    def _compress_query_content(self, query: str) -> Optional[str]:
+        """
+        긴 쿼리를 압축하는 로직
+        
+        Args:
+            query (str): 압축할 쿼리 문자열
+            
+        Returns:
+            Optional[str]: 압축된 쿼리. 압축이 불가능한 경우 None 반환
+        """
+        try:
+            # 기본적인 압축 규칙들
+            compression_rules = [
+                # 불필요한 공백 제거
+                (r'\s+', ' '),
+                # IN 절 압축 (IN (1,2,3,4,5) -> IN (...))
+                (r'IN\s*\([^)]+\)', 'IN (...)'),
+                # VALUES 절 압축
+                (r'VALUES\s*\([^)]+\)', 'VALUES (...)'),
+                # CASE WHEN 절 단순화
+                (r'CASE\s+WHEN.+?END', 'CASE ... END'),
+                # 긴 문자열 리터럴 압축
+                (r"'[^']{100,}'", "'...'"),
+                # 긴 숫자 리스트 압축
+                (r'\d+(?:\s*,\s*\d+){5,}', '...'),
+                # ORDER BY 절의 긴 컬럼 리스트 압축
+                (r'ORDER BY.*?(,.*?){5,}', 'ORDER BY ...'),
+                # GROUP BY 절의 긴 컬럼 리스트 압축
+                (r'GROUP BY.*?(,.*?){5,}', 'GROUP BY ...')
+            ]
+            
+            compressed = query
+            for pattern, replacement in compression_rules:
+                compressed = re.sub(pattern, replacement, compressed, flags=re.IGNORECASE)
+                
+            # 압축 후 크기가 원본의 50% 이상 줄어들지 않으면 압축 실패로 간주
+            if len(compressed.encode('utf-8')) > len(query.encode('utf-8')) * 0.5:
+                logger.warning("쿼리 압축 효과가 충분하지 않음")
+                return None
+                
+            return compressed
+            
+        except Exception as e:
+            logger.error(f"쿼리 내용 압축 중 오류 발생: {str(e)}")
+            return None
+            
     def _is_valid_query(self, parsed: Dict[str, Any]) -> bool:
         """
         쿼리 유효성 검사
