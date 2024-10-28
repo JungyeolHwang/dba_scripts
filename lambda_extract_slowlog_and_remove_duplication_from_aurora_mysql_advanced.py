@@ -45,7 +45,8 @@ class Config:
     @classmethod
     def from_event(cls, event: Dict[str, Any]) -> 'Config':
         return cls(
-            instance_id=event.get('instance_id') or os.environ.get('INSTANCE_ID'),
+            #instance_id=event.get('instance_id') or os.environ.get('INSTANCE_ID'),
+            instance_id="eng-production-dbnode02",
             region=event.get('region') or os.environ.get('REGION', DEFAULT_CONFIG["region"]),
             min_query_time=float(event.get('min_query_time') or os.environ.get('MIN_QUERY_TIME', DEFAULT_CONFIG["min_query_time"])),
             es_host=event.get('es_host') or os.environ.get('ES_HOST'),
@@ -80,16 +81,17 @@ class QueryNormalizer:
     def _init_patterns(self) -> None:
         self._patterns = {
             'whitespace': re.compile(r'\s+'),
-            'comments': re.compile(r'/\*.*?\*/|--[^\n]*'),
+            'comments': re.compile(r'/\*.*?\*/|#[^\n]*\n'),  # -- 로 시작하는 주석은 제외
             'semicolon': re.compile(r';+$'),
             'date_format': re.compile(r"DATE_FORMAT\s*\([^,]+,\s*'[^']*'\)", re.IGNORECASE),
             'numbers': re.compile(r'\b\d+\b'),
-            'quoted_strings': re.compile(r"'[^']*'"),
+            'quoted_strings': re.compile(r'"[^"]*"|\'[^\']*\''),
             'in_clause': re.compile(r'IN\s*\([^)]+\)', re.IGNORECASE),
             'table_aliases': re.compile(r'\b(?:AS\s+)?(?:[`"][\w\s]+[`"]|[\w$]+)\b', re.IGNORECASE),
             'column_aliases': re.compile(r'\b(?:[`"][\w\s]+[`"]|[\w$]+)\.[\w$]+\b', re.IGNORECASE),
             'use_statement': re.compile(r'(?i)^use\s+[\w_]+\s*;?\s*'),
-            'set_timestamp': re.compile(r'SET\s+timestamp\s*=\s*\d+\s*;?\s*', re.IGNORECASE)
+            'set_timestamp': re.compile(r'SET\s+timestamp\s*=\s*\d+\s*;?\s*', re.IGNORECASE),
+            'meta_info': re.compile(r'--\s*(?:REMOTE_ADDR|URL|Host)\s*:[^;]*?(?=\s*--|\s*[Ss][Ee][Ll][Ee][Cc][Tt]|\s*$)', re.IGNORECASE | re.DOTALL)
         }
     
     def _init_keywords(self) -> None:
@@ -117,26 +119,72 @@ class QueryNormalizer:
             
         return normalized
 
+    # IN 절 정규화
+    def _normalize_in_clauses(self, query: str) -> str:
+        # 잘린 IN 절을 처리할 수 있도록 정규 표현식을 보완
+        query = re.sub(r'IN\s*\([^)]*$', 'IN (...)', query, flags=re.IGNORECASE)  # 닫는 괄호가 없는 IN 절
+        query = re.sub(r'IN\s*\([^)]+\)', 'IN (...)', query, flags=re.IGNORECASE)  # 일반적인 IN 절
+        return query
+
+      
     def _normalize_query_impl(self, query: str) -> str:
-        # USE 구문과 SET TIMESTAMP 구문 제거
-        query = self._patterns['use_statement'].sub('', query)
+        """
+        SQL 쿼리 정규화 구현
+        """
+        logger.info("시작: 쿼리 정규화 프로세스")
+        logger.debug(f"입력 쿼리: {query}")
+
+        # 1. 먼저 모든 메타 정보 제거
         query = self._patterns['set_timestamp'].sub('', query)
-            
-        # 주요 정규화 단계들
-        query = self._patterns['comments'].sub('', query)
-        query = self._patterns['whitespace'].sub(' ', query)
-        query = self._patterns['semicolon'].sub('', query)
-        query = self._patterns['numbers'].sub('?', query)
-        query = self._patterns['quoted_strings'].sub('?', query)
-        query = self._patterns['in_clause'].sub('IN (?)', query)
-        
+        logger.debug(f"SET timestamp 제거 후: {query}")
+
+        query = self._patterns['use_statement'].sub('', query)
+        logger.debug(f"USE statement 제거 후: {query}")
+
+        query = self._patterns['meta_info'].sub('', query)
+        logger.debug(f"메타 정보 제거 후: {query}")
+
+        # 2. 세미콜론으로 분리해서 마지막 유효한 SQL만 추출
+        query_parts = [part.strip() for part in query.split(';') if part.strip()]
+        logger.debug(f"세미콜론으로 분리된 쿼리 파트들: {query_parts}")
+
+        actual_query = ''
+        for idx, part in enumerate(reversed(query_parts)):
+            part = part.strip()
+            logger.debug(f"처리 중인 쿼리 파트 {len(query_parts)-idx}/{len(query_parts)}: {part}")
+
+            if any(keyword in part.upper() for keyword in self._keywords):
+                actual_query = part
+                logger.info(f"유효한 SQL 쿼리 발견: {actual_query}")
+                break
+
+        if not actual_query:
+            logger.warning("유효한 SQL 쿼리를 찾지 못함")
+            return ""
+
+        # 3. 일반적인 정규화 단계들 적용
+        normalized = actual_query
+
+        normalized = self._patterns['whitespace'].sub(' ', normalized)
+        logger.debug(f"공백 정규화 후: {normalized}")
+
+        normalized = self._patterns['numbers'].sub('?', normalized)
+        logger.debug(f"숫자 정규화 후: {normalized}")
+
+        normalized = self._patterns['quoted_strings'].sub('?', normalized)
+        logger.debug(f"문자열 정규화 후: {normalized}")
+
+        # 4. IN 절 정규화 - 잘린 IN 절까지 포함하여 처리
+        normalized = self._normalize_in_clauses(normalized)
+        logger.debug(f"IN 절 정규화 후: {normalized}")
+
         # 결과 정리
-        query = query.strip()
-        
-        # 디버그 로깅
-        logger.debug(f"Normalized query result: {query}")
-        
-        return query.strip()
+        normalized = normalized.strip()
+
+        logger.info(f"최종 정규화된 쿼리: {normalized}")
+
+        return normalized
+
 
     def generate_hash(self, query: str) -> str:
         if query in self._hash_cache:
@@ -658,7 +706,8 @@ class SlowQueryLogProcessor:
             self.logger.debug(f"Processing query with timestamp: {current_timestamp}")
             
             # 인스턴스 ID를 포함한 동적 인덱스 이름 생성
-            index_name = f"{self.config.es_index_prefix}-{self.config.instance_id}"
+            #index_name = f"{self.config.es_index_prefix}-{self.config.instance_id}"
+            index_name = f"mysql-slowlog-eng-production-dbnode02"
         
             document = {
                 '_op_type': 'update',
@@ -717,7 +766,8 @@ class SlowQueryLogProcessor:
             
         try:
             # 동적 인덱스 이름 생성
-            index_name = f"{self.config.es_index_prefix}-{self.config.instance_id}"
+            #index_name = f"{self.config.es_index_prefix}-{self.config.instance_id}"
+            index_name = f"mysql-slowlog-eng-production-dbnode02"
             indexed = self.es_manager.bulk_index(self._batch, index_name)
             self._stats['indexed'] += indexed
             
