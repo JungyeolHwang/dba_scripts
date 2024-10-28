@@ -58,11 +58,11 @@ def invoke_slow_log_lambda(instance_info: Dict[str, str], dry_run: bool = True) 
     try:
         payload = {
             'instance_id': instance_info['instance_id'],
-            'es_index_prefix': f"mysql-slowlog-{instance_info['instance_id']}"  # 인덱스 이름에 인스턴스 ID 포함
+            'es_index_prefix': f"mysql-slowlog"  
         }
         
         logger.info(f"\nPreparing to invoke slow log lambda for instance:")
-        logger.info(f"Target Lambda: mysql-slowlog-to-es")
+        logger.info(f"Target Lambda: crawling_mysql_slowlog")
         logger.info(f"Payload to be sent: {json.dumps(payload, indent=2)}")
         
         if not dry_run:
@@ -88,8 +88,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.info("\n=== Starting RDS/Aurora Slow Log Processor ===")
         logger.info(f"Event received: {json.dumps(event, indent=2)}")
         
-        # dry_run 모드 확인 (기본값: True)
-        dry_run = event.get('dry_run', True)
+        # dry_run 모드 확인 (기본값: False)
+        dry_run = event.get('dry_run', False)
         logger.info(f"Operating in {'DRY RUN' if dry_run else 'PRODUCTION'} mode")
         
         # 모든 대상 인스턴스 목록 가져오기
