@@ -514,67 +514,63 @@ class ElasticsearchManager:
             return 0
                 
         try:
-            # 기존 인덱스가 있다면 삭제
-            if self.es_client.indices.exists(index=index_name):
-                self.logger.info(f"Deleting existing index: {index_name}")
-                self.es_client.indices.delete(index=index_name)
-            
-            # 새 인덱스 생성
-            self.logger.info(f"Creating new index: {index_name}")
-            mappings = {
-                "mappings": {
-                    "properties": {
-                        "query": {"type": "text"},
-                        "normalized_query": {"type": "text"},
-                        "query_hash": {"type": "keyword"},
-                        "timestamp": {
-                            "type": "date",
-                            "format": "strict_date_optional_time||epoch_millis"
-                        },
-                        "query_time": {"type": "float"},
-                        "lock_time": {"type": "float"},
-                        "rows_examined": {"type": "long"},
-                        "rows_sent": {"type": "long"},
-                        "execution_count": {"type": "long"},
-                        "timestamps": {
-                            "type": "date",
-                            "format": "strict_date_optional_time||epoch_millis"
-                        },
-                        "last_seen": {
-                            "type": "date",
-                            "format": "strict_date_optional_time||epoch_millis"
+            # 인덱스가 없을 때만 생성
+            if not self.es_client.indices.exists(index=index_name):
+                self.logger.info(f"Creating new index: {index_name}")
+                mappings = {
+                    "mappings": {
+                        "properties": {
+                            "query": {"type": "text"},
+                            "normalized_query": {"type": "text"},
+                            "query_hash": {"type": "keyword"},
+                            "timestamp": {
+                                "type": "date",
+                                "format": "strict_date_optional_time||epoch_millis"
+                            },
+                            "query_time": {"type": "float"},
+                            "lock_time": {"type": "float"},
+                            "rows_examined": {"type": "long"},
+                            "rows_sent": {"type": "long"},
+                            "execution_count": {"type": "long"},
+                            "timestamps": {
+                                "type": "date",
+                                "format": "strict_date_optional_time||epoch_millis"
+                            },
+                            "last_seen": {
+                                "type": "date",
+                                "format": "strict_date_optional_time||epoch_millis"
+                            },
+                            "max_query_time": {"type": "float"},
+                            "instance_id": {"type": "keyword"}
                         }
                     },
-                    "dynamic_templates": [
-                        {
-                            "timestamps_as_date": {
-                                "path_match": "timestamps.*",
-                                "mapping": {
-                                    "type": "date",
-                                    "format": "strict_date_optional_time||epoch_millis"
-                                }
-                            }
-                        }
-                    ]
-                },
-                "settings": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 1
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 1
+                    }
                 }
-            }
-            self.es_client.indices.create(index=index_name, body=mappings)
+                self.es_client.indices.create(index=index_name, body=mappings)
             
-            # 벌크 인덱싱
+            # 벌크 인덱싱 전 로그
             self.logger.info(f"Starting bulk index of {len(documents)} documents to {index_name}")
-            success, errors = bulk(
+            self.logger.debug(f"Sample document: {json.dumps(documents[0], indent=2) if documents else 'No documents'}")
+            
+            # 벌크 인덱싱 수행
+            success, failed = bulk(
                 self.es_client,
                 documents,
-                stats_only=False,
-                refresh=True,
-                request_timeout=30
+                stats_only=True,  # 성능을 위해 stats_only=True로 변경
+                refresh=True,     # 즉시 검색 가능하도록
+                request_timeout=30,
+                raise_on_error=False  # 일부 실패해도 계속 진행
             )
             
-            self.logger.info(f"Bulk indexing completed - Success: {success}, Errors: {errors}")
+            # 결과 로깅
+            self.logger.info(f"Bulk indexing completed - Success: {success}, Failed: {failed}")
+            
+            if failed > 0:
+                self.logger.warning(f"Some documents failed to index: {failed} failures")
+                
             return success
                 
         except Exception as e:
@@ -666,7 +662,7 @@ class SlowQueryLogProcessor:
         
             document = {
                 '_op_type': 'update',
-                '_index': index_name
+                '_index': index_name,
                 '_id': query_hash,
                 'script': {
                     'source': '''
